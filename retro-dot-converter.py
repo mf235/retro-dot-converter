@@ -53,6 +53,9 @@ class RetroConverter:
         self.output_img = None
         self.input_img_tk = None
         self.output_img_tk = None
+        self.preview_after_id = None
+        self._auto_preview_running = False
+        self.rembg_sessions = {}
 
         main_frame = tk.Frame(root)
         main_frame.pack(fill="both", expand=True, padx=15, pady=10)
@@ -88,6 +91,8 @@ class RetroConverter:
         self.output_preview_frame.pack_propagate(False)
         self.lbl_output_preview = tk.Label(self.output_preview_frame, bg="#e8e8e8")
         self.lbl_output_preview.place(relx=0.5, rely=0.5, anchor="center")
+        self.lbl_preview_status = tk.Label(output_frame, text="パラメータ変更で自動プレビューできます", fg="#666666", font=("メイリオ", 8))
+        self.lbl_preview_status.pack(pady=(0, 6))
 
         # ====================== ボタンエリア ======================
         button_frame = tk.Frame(left_frame)
@@ -96,6 +101,17 @@ class RetroConverter:
         self.var_dnd_auto = tk.BooleanVar(value=False)
         self.chk_dnd_auto = tk.Checkbutton(button_frame, text="✅ ファイルドロップで即時変換", variable=self.var_dnd_auto, font=("メイリオ", 10, "bold"), fg="#333333")
         self.chk_dnd_auto.pack(anchor="w", pady=(0, 5))
+
+        self.var_auto_preview = tk.BooleanVar(value=True)
+        self.chk_auto_preview = tk.Checkbutton(
+            button_frame,
+            text="✅ パラメータ変更で自動プレビュー（保存なし）",
+            variable=self.var_auto_preview,
+            command=lambda: self.schedule_auto_preview(delay=100),
+            font=("メイリオ", 10),
+            fg="#333333"
+        )
+        self.chk_auto_preview.pack(anchor="w", pady=(0, 5))
 
         filename_frame = tk.Frame(button_frame)
         filename_frame.pack(anchor="w", pady=(0, 10))
@@ -230,6 +246,9 @@ class RetroConverter:
         
         tk.Label(param_frame, text="]", font=("メイリオ", 9)).pack(side="left")
 
+        # ====================== 自動プレビュー設定 ======================
+        self.setup_auto_preview_bindings()
+
         # ====================== Drag & Drop 設定 ======================
         self.root.drop_target_register(DND_FILES)
         self.root.dnd_bind('<<Drop>>', self.drop_image)
@@ -278,6 +297,7 @@ class RetroConverter:
         self.lbl_input_preview.config(image=self.input_img_tk)
 
         self.btn_convert.config(state="normal")
+        self.schedule_auto_preview(delay=100)
 
         if self.var_dnd_auto.get():
             self.root.after(100, self.convert) 
@@ -305,6 +325,7 @@ class RetroConverter:
         self.lbl_input_preview.config(image=self.input_img_tk)
 
         self.btn_convert.config(state="normal")
+        self.schedule_auto_preview(delay=100)
 
     # ====================== プリセット ======================
     def apply_preset(self, event=None):
@@ -313,6 +334,7 @@ class RetroConverter:
         if not preset:
             self.size_combo.config(state="readonly")
             self.colors_combo.config(state="readonly")
+            self.schedule_auto_preview(delay=100)
             return
 
         if preset == "PC98":
@@ -333,6 +355,7 @@ class RetroConverter:
 
         self.size_combo.config(state="disabled")
         self.colors_combo.config(state="disabled")
+        self.schedule_auto_preview(delay=100)
 
     # ====================== 輪郭線処理 ======================
     def enhance_outline_weak(self, img):
@@ -367,106 +390,210 @@ class RetroConverter:
         
         return Image.fromarray(shifted, mode=img.mode)
 
+    # ====================== 自動プレビュー関連 ======================
+    def setup_auto_preview_bindings(self):
+        """パラメータ変更時に保存なしプレビューを遅延実行する"""
+        vars_to_trace = [
+            self.preset_var,
+            self.size_var,
+            self.colors_var,
+            self.format_var,
+            self.bg_var,
+            self.resize_var,
+            self.model_var,
+            self.var_auto_bg,
+            self.var_pre_dot,
+            self.var_outline,
+            self.var_dot_boost,
+            self.var_anti_alias,
+            self.var_chromatic,
+            self.var_chromatic_intensity,
+            self.var_exp_skin_protect,
+            self.var_pre_thresh,
+            self.var_post_thresh,
+        ]
+
+        for var in vars_to_trace:
+            try:
+                var.trace_add("write", lambda *args: self.schedule_auto_preview())
+            except Exception:
+                pass
+
+    def schedule_auto_preview(self, *args, delay=500):
+        """入力中に何度も変換しないよう、少し待ってから1回だけプレビューする"""
+        if not getattr(self, "var_auto_preview", None) or not self.var_auto_preview.get():
+            if hasattr(self, "lbl_preview_status"):
+                self.lbl_preview_status.config(text="自動プレビュー: OFF")
+            return
+
+        if not self.input_paths:
+            return
+
+        if self.preview_after_id is not None:
+            try:
+                self.root.after_cancel(self.preview_after_id)
+            except Exception:
+                pass
+
+        if hasattr(self, "lbl_preview_status"):
+            self.lbl_preview_status.config(text="プレビュー更新待ち...")
+
+        self.preview_after_id = self.root.after(delay, self.preview_current_settings)
+
+    def preview_current_settings(self):
+        """現在の設定で1枚目だけプレビューする。保存と連番更新はしない"""
+        self.preview_after_id = None
+
+        if self._auto_preview_running or not self.input_paths:
+            return
+
+        self._auto_preview_running = True
+        try:
+            if hasattr(self, "lbl_preview_status"):
+                self.lbl_preview_status.config(text="プレビュー更新中...")
+
+            preview_path = self.input_paths[0]
+            self.output_img = self.process_image(preview_path, show_rembg_notice=False)
+            self.show_output_preview(self.output_img)
+
+            if hasattr(self, "lbl_preview_status"):
+                self.lbl_preview_status.config(
+                    text=f"自動プレビュー: {os.path.basename(preview_path)} / 保存なし"
+                )
+
+        except Exception as e:
+            if hasattr(self, "lbl_preview_status"):
+                self.lbl_preview_status.config(text=f"プレビュー不可: {str(e)}")
+        finally:
+            self._auto_preview_running = False
+
+    def show_output_preview(self, img):
+        """出力画像をプレビュー枠に表示する"""
+        preview_out = img.copy()
+        if preview_out.mode in ('RGBA', 'LA'):
+            bg = Image.new("RGBA", preview_out.size, (232, 232, 232, 255))
+            bg.alpha_composite(preview_out)
+            preview_out = bg.convert("RGB")
+
+        preview_out.thumbnail((300, 300))
+        self.output_img_tk = ImageTk.PhotoImage(preview_out)
+        self.lbl_output_preview.config(image=self.output_img_tk)
+
+    def get_rembg_session(self):
+        """rembgセッションをモデルごとにキャッシュする"""
+        model_name = self.model_var.get()
+        if model_name not in self.rembg_sessions:
+            self.rembg_sessions[model_name] = new_session(model_name)
+        return self.rembg_sessions[model_name]
+
+    # ====================== 変換コア処理 ======================
+    def process_image(self, path, show_rembg_notice=False):
+        """画像1枚を現在の設定で変換する。保存はしない"""
+        orig_img_raw = Image.open(path)
+        has_alpha = orig_img_raw.mode in ('RGBA', 'LA') or (orig_img_raw.mode == 'P' and 'transparency' in orig_img_raw.info)
+        if has_alpha:
+            orig_alpha = orig_img_raw.convert("RGBA").getchannel('A')
+
+        img = self.load_image_with_bg(path, for_preview=False)
+
+        mode = self.bg_var.get()
+        resample = Image.BICUBIC if "Bicubic" in self.resize_var.get() else \
+                   Image.BILINEAR if "Bilinear" in self.resize_var.get() else Image.NEAREST
+
+        size_str = self.size_var.get()
+        if size_str == "現状維持":
+            target_w, target_h = img.size
+        else:
+            if "(" in size_str:
+                size_str = size_str.split()[0]
+            target_w, target_h = map(int, size_str.split('x'))
+
+        if mode == "拡大 (stretch)":
+            img = img.resize((target_w, target_h), resample)
+        elif mode == "切り抜き (crop) ※縦横比維持・サイズ可変":
+            orig_w, orig_h = img.size
+            scale = min(target_w / orig_w, target_h / orig_h)
+            new_w = int(orig_w * scale)
+            new_h = int(orig_h * scale)
+            img = img.resize((new_w, new_h), resample)
+        else:
+            if self.var_pre_dot.get():
+                orig_w, orig_h = img.size
+                scale = min(target_w / orig_w, target_h / orig_h)
+                new_w = int(orig_w * scale)
+                new_h = int(orig_h * scale)
+                img = img.resize((new_w, new_h), resample)
+
+        if self.var_outline.get():
+            img = self.enhance_outline_weak(img)
+
+        if self.var_anti_alias.get() and self.var_outline.get():
+            img = self.apply_anti_alias_to_outline(img)
+
+        if self.var_dot_boost.get() != "なし":
+            img = self.dot_boost(img, self.var_dot_boost.get())
+
+        if getattr(self, "var_exp_skin_protect", None) and self.var_exp_skin_protect.get():
+            edges = img.filter(ImageFilter.FIND_EDGES).convert("L")
+            smoothed = img.filter(ImageFilter.SMOOTH_MORE).filter(ImageFilter.SMOOTH_MORE)
+            edge_mask = edges.point(lambda x: 255 if x > 20 else 0, "1")
+            img = Image.composite(img, smoothed, edge_mask)
+
+        colors = int(self.colors_var.get())
+        preset = self.preset_var.get()
+        skin_protect = getattr(self, "var_exp_skin_protect", None) and self.var_exp_skin_protect.get()
+
+        try:
+            pre_thresh = float(self.var_pre_thresh.get())
+        except ValueError:
+            pre_thresh = 130.0
+
+        try:
+            post_thresh = float(self.var_post_thresh.get())
+        except ValueError:
+            post_thresh = 45.0
+
+        output_img = self.bayer_ordered_dither(
+            img,
+            colors,
+            preset,
+            skin_protect=skin_protect,
+            pre_thresh=pre_thresh,
+            post_thresh=post_thresh
+        )
+
+        if "透過" in self.bg_var.get() and has_alpha:
+            final_alpha = orig_alpha.resize(output_img.size, resample)
+            output_img.putalpha(final_alpha)
+
+        # --- rembgが有効かつチェックされている場合のみ処理 ---
+        if REMBG_AVAILABLE and getattr(self, "var_auto_bg", None) and self.var_auto_bg.get():
+            if show_rembg_notice:
+                messagebox.showinfo("処理中", f"自動背景除去を実行しています...\nモデル: {self.model_var.get()}")
+            session = self.get_rembg_session()
+            output_img = remove(output_img, session=session)
+
+        # --- 色ずれ（色収差）処理を追加 ---
+        if getattr(self, "var_chromatic", None) and self.var_chromatic.get():
+            try:
+                intensity = int(self.var_chromatic_intensity.get())
+                output_img = self.apply_chromatic_aberration(output_img, intensity)
+            except ValueError:
+                pass
+
+        return output_img
+
     # ====================== メイン変換処理 (複数ファイル対応) ======================
     def convert(self):
         if not self.input_paths:
             return
-            
+
         success_count = 0
-        
+        filename = ""
+
         try:
             for path in self.input_paths:
-                orig_img_raw = Image.open(path)
-                has_alpha = orig_img_raw.mode in ('RGBA', 'LA') or (orig_img_raw.mode == 'P' and 'transparency' in orig_img_raw.info)
-                if has_alpha:
-                    orig_alpha = orig_img_raw.convert("RGBA").getchannel('A')
-                
-                img = self.load_image_with_bg(path, for_preview=False)
-
-                mode = self.bg_var.get()
-                resample = Image.BICUBIC if "Bicubic" in self.resize_var.get() else \
-                           Image.BILINEAR if "Bilinear" in self.resize_var.get() else Image.NEAREST
-
-                size_str = self.size_var.get()
-                if size_str == "現状維持":
-                    target_w, target_h = img.size
-                else:
-                    if "(" in size_str:
-                        size_str = size_str.split()[0]
-                    target_w, target_h = map(int, size_str.split('x'))
-
-                if mode == "拡大 (stretch)":
-                    img = img.resize((target_w, target_h), resample)
-                elif mode == "切り抜き (crop) ※縦横比維持・サイズ可変":
-                    orig_w, orig_h = img.size
-                    scale = min(target_w / orig_w, target_h / orig_h)
-                    new_w = int(orig_w * scale)
-                    new_h = int(orig_h * scale)
-                    img = img.resize((new_w, new_h), resample)
-                else:
-                    if self.var_pre_dot.get():
-                        orig_w, orig_h = img.size
-                        scale = min(target_w / orig_w, target_h / orig_h)
-                        new_w = int(orig_w * scale)
-                        new_h = int(orig_h * scale)
-                        img = img.resize((new_w, new_h), resample)
-
-                if self.var_outline.get():
-                    img = self.enhance_outline_weak(img)
-
-                if self.var_anti_alias.get() and self.var_outline.get():
-                    img = self.apply_anti_alias_to_outline(img)
-
-                if self.var_dot_boost.get() != "なし":
-                    img = self.dot_boost(img, self.var_dot_boost.get())
-
-                if getattr(self, "var_exp_skin_protect", None) and self.var_exp_skin_protect.get():
-                    edges = img.filter(ImageFilter.FIND_EDGES).convert("L")
-                    smoothed = img.filter(ImageFilter.SMOOTH_MORE).filter(ImageFilter.SMOOTH_MORE)
-                    edge_mask = edges.point(lambda x: 255 if x > 20 else 0, "1")
-                    img = Image.composite(img, smoothed, edge_mask)
-
-                colors = int(self.colors_var.get())
-                preset = self.preset_var.get()
-                skin_protect = getattr(self, "var_exp_skin_protect", None) and self.var_exp_skin_protect.get()
-                
-                try:
-                    pre_thresh = float(self.var_pre_thresh.get())
-                except ValueError:
-                    pre_thresh = 130.0
-                    
-                try:
-                    post_thresh = float(self.var_post_thresh.get())
-                except ValueError:
-                    post_thresh = 45.0
-
-                self.output_img = self.bayer_ordered_dither(
-                    img, 
-                    colors, 
-                    preset, 
-                    skin_protect=skin_protect,
-                    pre_thresh=pre_thresh,
-                    post_thresh=post_thresh
-                )
-
-                if "透過" in self.bg_var.get() and has_alpha:
-                    final_alpha = orig_alpha.resize(self.output_img.size, resample)
-                    self.output_img.putalpha(final_alpha)
-
-                # --- rembgが有効かつチェックされている場合のみ処理 ---
-                if REMBG_AVAILABLE and getattr(self, "var_auto_bg", None) and self.var_auto_bg.get():
-                    if success_count == 0: 
-                        messagebox.showinfo("処理中", f"自動背景除去を実行しています...\nモデル: {self.model_var.get()}")
-                    session = new_session(self.model_var.get())
-                    self.output_img = remove(self.output_img, session=session)
-
-                # --- 色ずれ（色収差）処理を追加 ---
-                if getattr(self, "var_chromatic", None) and self.var_chromatic.get():
-                    try:
-                        intensity = int(self.var_chromatic_intensity.get())
-                        self.output_img = self.apply_chromatic_aberration(self.output_img, intensity)
-                    except ValueError:
-                        pass
+                self.output_img = self.process_image(path, show_rembg_notice=(success_count == 0))
 
                 # --- 自動保存処理 ---
                 ext = self.format_var.get().lower()
@@ -487,7 +614,7 @@ class RetroConverter:
                     self.var_filename_num.set(str(next_num).zfill(len(num_str)))
                 except ValueError:
                     pass
-                
+
                 success_count += 1
 
             last_path = self.input_paths[-1]
@@ -496,15 +623,10 @@ class RetroConverter:
             self.input_img_tk = ImageTk.PhotoImage(preview_in)
             self.lbl_input_preview.config(image=self.input_img_tk)
 
-            preview_out = self.output_img.copy()
-            if preview_out.mode in ('RGBA', 'LA'):
-                bg = Image.new("RGBA", preview_out.size, (232, 232, 232, 255))
-                bg.alpha_composite(preview_out)
-                preview_out = bg.convert("RGB")
-            
-            preview_out.thumbnail((300, 300))
-            self.output_img_tk = ImageTk.PhotoImage(preview_out)
-            self.lbl_output_preview.config(image=self.output_img_tk)
+            self.show_output_preview(self.output_img)
+
+            if hasattr(self, "lbl_preview_status"):
+                self.lbl_preview_status.config(text=f"保存済みプレビュー: {os.path.basename(last_path)}")
 
             if len(self.input_paths) == 1:
                 messagebox.showinfo("変換＆保存完了", f"{self.output_img.size[0]}x{self.output_img.size[1]} 完了！\n{filename} を保存したぜ！")
