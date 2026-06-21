@@ -17,6 +17,8 @@ from tkinterdnd2 import * # Drag&Drop用
 from PIL import Image, ImageTk, ImageEnhance, ImageFilter, ImageOps
 import numpy as np
 import os
+import shutil
+from datetime import datetime
 import re # 自然順ソート用に追加
 from sklearn.cluster import MiniBatchKMeans
 
@@ -34,6 +36,17 @@ def natural_sort_key(s):
     """ファイル名の中の数字を数値として評価してソートするためのキー関数"""
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
 # ==================================================
+
+SUPPORTED_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+
+SAVE_FORMAT_BY_EXTENSION = {
+    ".png": "PNG",
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".webp": "WEBP",
+    ".bmp": "BMP",
+    ".gif": "GIF",
+}
 
 class RetroConverter:
     def __init__(self, root):
@@ -101,6 +114,16 @@ class RetroConverter:
         self.var_dnd_auto = tk.BooleanVar(value=False)
         self.chk_dnd_auto = tk.Checkbutton(button_frame, text="✅ ファイルドロップで即時変換", variable=self.var_dnd_auto, font=("メイリオ", 10, "bold"), fg="#333333")
         self.chk_dnd_auto.pack(anchor="w", pady=(0, 5))
+
+        self.var_dnd_folder_overwrite = tk.BooleanVar(value=False)
+        self.chk_dnd_folder_overwrite = tk.Checkbutton(
+            button_frame,
+            text="✅ フォルダの場合は上書きモードで即時変換保存する",
+            variable=self.var_dnd_folder_overwrite,
+            font=("メイリオ", 10, "bold"),
+            fg="#8a3a00"
+        )
+        self.chk_dnd_folder_overwrite.pack(anchor="w", pady=(0, 5))
 
         self.var_auto_preview = tk.BooleanVar(value=True)
         self.chk_auto_preview = tk.Checkbutton(
@@ -274,8 +297,37 @@ class RetroConverter:
 
     # ====================== Drag & Drop 処理 ======================
     def drop_image(self, event):
-        files = self.root.tk.splitlist(event.data)
-        valid_files = [f for f in files if os.path.isfile(f)]
+        dropped_paths = [os.path.abspath(p) for p in self.root.tk.splitlist(event.data)]
+        folder_paths = [p for p in dropped_paths if os.path.isdir(p)]
+        direct_files = [p for p in dropped_paths if os.path.isfile(p) and self.is_supported_image_file(p)]
+
+        # フォルダ上書きモード: フォルダD&D時だけ、サブフォルダ込みで即時変換・上書き保存
+        if folder_paths and getattr(self, "var_dnd_folder_overwrite", None) and self.var_dnd_folder_overwrite.get():
+            folder_paths.sort(key=lambda x: natural_sort_key(os.path.basename(x)))
+            direct_files.sort(key=lambda x: natural_sort_key(os.path.basename(x)))
+            folder_image_paths = self.collect_image_files_from_folders(folder_paths)
+            overwrite_paths = self.unique_paths(direct_files + folder_image_paths)
+
+            if not overwrite_paths:
+                messagebox.showwarning("エラー", "フォルダ内に有効な画像ファイルがありません")
+                return
+
+            self.input_paths = overwrite_paths
+            self.update_input_preview(overwrite_paths[0])
+
+            folder_label = os.path.basename(folder_paths[0]) or folder_paths[0]
+            if len(folder_paths) == 1:
+                self.lbl_input.config(text=f"入力フォルダ: {folder_label} / 画像 {len(overwrite_paths)}件")
+            else:
+                self.lbl_input.config(text=f"入力フォルダ: {folder_label} ほか {len(folder_paths)-1}件 / 画像 {len(overwrite_paths)}件")
+
+            self.btn_convert.config(state="normal")
+            if hasattr(self, "lbl_preview_status"):
+                self.lbl_preview_status.config(text="フォルダ上書き変換待ち...")
+            self.root.after(100, lambda: self.convert_overwrite_paths(overwrite_paths, folder_paths))
+            return
+
+        valid_files = direct_files
 
         if not valid_files:
             messagebox.showwarning("エラー", "有効な画像ファイルがありません")
@@ -291,16 +343,48 @@ class RetroConverter:
         else:
             self.lbl_input.config(text=f"入力画像: {os.path.basename(valid_files[0])} ほか {len(valid_files)-1}件")
         
-        preview = self.load_image_with_bg(valid_files[0], for_preview=True)
-        preview.thumbnail((300, 300))
-        self.input_img_tk = ImageTk.PhotoImage(preview)
-        self.lbl_input_preview.config(image=self.input_img_tk)
+        self.update_input_preview(valid_files[0])
 
         self.btn_convert.config(state="normal")
         self.schedule_auto_preview(delay=100)
 
         if self.var_dnd_auto.get():
             self.root.after(100, self.convert) 
+
+    def is_supported_image_file(self, path):
+        return os.path.splitext(path)[1].lower() in SUPPORTED_IMAGE_EXTENSIONS
+
+    def unique_paths(self, paths):
+        """同じ画像が二重指定された場合に、順序を保って1回だけ処理する。"""
+        seen = set()
+        unique = []
+        for path in paths:
+            key = os.path.normcase(os.path.abspath(path))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+        return unique
+
+    def collect_image_files_from_folders(self, folder_paths):
+        """D&Dされたフォルダ以下の画像をサブフォルダ込みで集める。バックアップフォルダは除外する。"""
+        image_paths = []
+        for folder in folder_paths:
+            for current_dir, dir_names, file_names in os.walk(folder):
+                dir_names[:] = [d for d in dir_names if not d.startswith("_backup.")]
+                file_names.sort(key=natural_sort_key)
+                for file_name in file_names:
+                    path = os.path.join(current_dir, file_name)
+                    if self.is_supported_image_file(path):
+                        image_paths.append(path)
+        image_paths.sort(key=lambda x: natural_sort_key(os.path.normcase(os.path.abspath(x))))
+        return image_paths
+
+    def update_input_preview(self, path):
+        preview = self.load_image_with_bg(path, for_preview=True)
+        preview.thumbnail((300, 300))
+        self.input_img_tk = ImageTk.PhotoImage(preview)
+        self.lbl_input_preview.config(image=self.input_img_tk)
 
     # ====================== 画像選択処理 ======================
     def select_image(self):
@@ -319,10 +403,7 @@ class RetroConverter:
         else:
             self.lbl_input.config(text=f"入力画像: {os.path.basename(self.input_paths[0])} ほか {len(self.input_paths)-1}件")
         
-        preview = self.load_image_with_bg(self.input_paths[0], for_preview=True)
-        preview.thumbnail((300, 300))
-        self.input_img_tk = ImageTk.PhotoImage(preview)
-        self.lbl_input_preview.config(image=self.input_img_tk)
+        self.update_input_preview(self.input_paths[0])
 
         self.btn_convert.config(state="normal")
         self.schedule_auto_preview(delay=100)
@@ -582,6 +663,144 @@ class RetroConverter:
                 pass
 
         return output_img
+
+    def make_backup_root(self):
+        """スクリプトと同じフォルダに _backup.日付 フォルダを作る。"""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_root = os.path.join(script_dir, f"_backup.{timestamp}")
+
+        suffix = 2
+        unique_backup_root = backup_root
+        while os.path.exists(unique_backup_root):
+            unique_backup_root = f"{backup_root}_{suffix}"
+            suffix += 1
+
+        os.makedirs(unique_backup_root, exist_ok=True)
+        return unique_backup_root
+
+    def backup_path_for_source(self, source_path, folder_roots, backup_root):
+        """元画像の配置をなるべく保ったバックアップ先パスを返す。"""
+        source_abs = os.path.abspath(source_path)
+        matching_root = None
+
+        for root in sorted(folder_roots, key=len, reverse=True):
+            root_abs = os.path.abspath(root)
+            try:
+                common = os.path.commonpath([source_abs, root_abs])
+            except ValueError:
+                continue
+            if common == root_abs:
+                matching_root = root_abs
+                break
+
+        if matching_root:
+            root_name = os.path.basename(os.path.normpath(matching_root)) or "dropped_folder"
+            relative_path = os.path.relpath(source_abs, matching_root)
+            backup_path = os.path.join(backup_root, root_name, relative_path)
+        else:
+            backup_path = os.path.join(backup_root, "_files", os.path.basename(source_abs))
+
+        return self.make_unique_path(backup_path)
+
+    def make_unique_path(self, path):
+        """同名バックアップがある場合だけ _2, _3... を付ける。"""
+        if not os.path.exists(path):
+            return path
+
+        base, ext = os.path.splitext(path)
+        index = 2
+        while True:
+            candidate = f"{base}_{index}{ext}"
+            if not os.path.exists(candidate):
+                return candidate
+            index += 1
+
+    def save_converted_over_original(self, img, source_path):
+        """変換後画像を元ファイルと同じ拡張子・同じ場所に安全に上書き保存する。"""
+        ext = os.path.splitext(source_path)[1].lower()
+        save_format = SAVE_FORMAT_BY_EXTENSION.get(ext)
+        if not save_format:
+            raise ValueError(f"未対応の保存形式です: {ext}")
+
+        save_img = img
+        if save_format in ("JPEG", "BMP"):
+            save_img = img.convert("RGB")
+
+        temp_path = f"{source_path}.retro_tmp{ext}"
+        try:
+            save_kwargs = {}
+            if save_format == "JPEG":
+                save_kwargs.update({"quality": 95, "subsampling": 0})
+            elif save_format == "WEBP":
+                save_kwargs.update({"quality": 95})
+
+            save_img.save(temp_path, format=save_format, **save_kwargs)
+            os.replace(temp_path, source_path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+    def convert_overwrite_paths(self, image_paths, folder_roots):
+        """フォルダD&D用。元画像をバックアップしてから、同じ場所へ上書き保存する。"""
+        if not image_paths:
+            return
+
+        backup_root = self.make_backup_root()
+        success_count = 0
+        error_messages = []
+        last_success_path = None
+
+        try:
+            for index, path in enumerate(image_paths, start=1):
+                if hasattr(self, "lbl_preview_status"):
+                    self.lbl_preview_status.config(text=f"フォルダ上書き変換中... {index}/{len(image_paths)}")
+                    self.root.update_idletasks()
+
+                try:
+                    backup_path = self.backup_path_for_source(path, folder_roots, backup_root)
+                    os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+                    shutil.copy2(path, backup_path)
+
+                    output_img = self.process_image(path, show_rembg_notice=False)
+                    self.save_converted_over_original(output_img, path)
+
+                    self.output_img = output_img
+                    last_success_path = path
+                    success_count += 1
+
+                except Exception as item_error:
+                    error_messages.append(f"{os.path.basename(path)}: {item_error}")
+
+            if last_success_path:
+                self.update_input_preview(last_success_path)
+                self.show_output_preview(self.output_img)
+
+            if hasattr(self, "lbl_preview_status"):
+                self.lbl_preview_status.config(text=f"フォルダ上書き保存済み: {success_count}/{len(image_paths)}件")
+
+            if error_messages:
+                preview_errors = "\n".join(error_messages[:8])
+                if len(error_messages) > 8:
+                    preview_errors += f"\n...ほか {len(error_messages)-8}件"
+                messagebox.showwarning(
+                    "フォルダ上書き変換 完了（一部エラー）",
+                    f"成功: {success_count}件 / 失敗: {len(error_messages)}件\n"
+                    f"バックアップ: {backup_root}\n\n"
+                    f"{preview_errors}"
+                )
+            else:
+                messagebox.showinfo(
+                    "フォルダ上書き変換完了",
+                    f"{success_count}件の画像を上書き保存したぜ！\n"
+                    f"バックアップ: {backup_root}"
+                )
+
+        except Exception as e:
+            messagebox.showerror("エラー", f"フォルダ上書き変換中にエラーが発生しました:\n{str(e)}")
 
     # ====================== メイン変換処理 (複数ファイル対応) ======================
     def convert(self):
