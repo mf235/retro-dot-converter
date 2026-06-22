@@ -177,6 +177,17 @@ class RetroConverter:
         "1024x768", "1280x720", "1920x1080")
         self.size_combo.pack(anchor="w", pady=2)
 
+        self.var_no_upscale = tk.BooleanVar(value=False)
+        self.chk_no_upscale = tk.Checkbutton(
+            right_frame,
+            text="✅ 拡大しない",
+            variable=self.var_no_upscale,
+            command=lambda: self.schedule_auto_preview(delay=100),
+            font=("メイリオ", 10),
+            anchor="w"
+        )
+        self.chk_no_upscale.pack(fill="x", pady=(2, 4))
+
         tk.Label(right_frame, text="色数", font=("メイリオ", 10), anchor="w").pack(fill="x", pady=(10,0))
         self.colors_var = tk.StringVar(value="8")
         self.colors_combo = ttk.Combobox(right_frame, textvariable=self.colors_var, state="readonly", width=35)
@@ -477,6 +488,7 @@ class RetroConverter:
         vars_to_trace = [
             self.preset_var,
             self.size_var,
+            self.var_no_upscale,
             self.colors_var,
             self.format_var,
             self.bg_var,
@@ -567,6 +579,15 @@ class RetroConverter:
             self.rembg_sessions[model_name] = new_session(model_name)
         return self.rembg_sessions[model_name]
 
+    def should_skip_resize_for_no_upscale(self, current_size, target_size):
+        """「拡大しない」ON時に、拡大を含むリサイズかどうか判定する。"""
+        if not getattr(self, "var_no_upscale", None) or not self.var_no_upscale.get():
+            return False
+
+        current_w, current_h = current_size
+        target_w, target_h = target_size
+        return target_w > current_w or target_h > current_h
+
     # ====================== 変換コア処理 ======================
     def process_image(self, path, show_rembg_notice=False):
         """画像1枚を現在の設定で変換する。保存はしない"""
@@ -590,20 +611,23 @@ class RetroConverter:
             target_w, target_h = map(int, size_str.split('x'))
 
         if mode == "拡大 (stretch)":
-            img = img.resize((target_w, target_h), resample)
+            if not self.should_skip_resize_for_no_upscale(img.size, (target_w, target_h)):
+                img = img.resize((target_w, target_h), resample)
         elif mode == "切り抜き (crop) ※縦横比維持・サイズ可変":
             orig_w, orig_h = img.size
             scale = min(target_w / orig_w, target_h / orig_h)
             new_w = int(orig_w * scale)
             new_h = int(orig_h * scale)
-            img = img.resize((new_w, new_h), resample)
+            if not self.should_skip_resize_for_no_upscale((orig_w, orig_h), (new_w, new_h)):
+                img = img.resize((new_w, new_h), resample)
         else:
             if self.var_pre_dot.get():
                 orig_w, orig_h = img.size
                 scale = min(target_w / orig_w, target_h / orig_h)
                 new_w = int(orig_w * scale)
                 new_h = int(orig_h * scale)
-                img = img.resize((new_w, new_h), resample)
+                if not self.should_skip_resize_for_no_upscale((orig_w, orig_h), (new_w, new_h)):
+                    img = img.resize((new_w, new_h), resample)
 
         if self.var_outline.get():
             img = self.enhance_outline_weak(img)
